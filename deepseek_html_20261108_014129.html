@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Hex Knockout 3D</title>
+<style>
+:root{--bg:#072a4d;color-scheme:dark}
+html,body{margin:0;height:100%;background:var(--bg);overflow:hidden;font-family:system-ui,-apple-system,sans-serif;touch-action:none;overscroll-behavior:none}
+canvas{position:fixed;left:0;top:0;width:100%;height:100%;display:block}
+#gl{z-index:1}#c{z-index:2;pointer-events:none}
+.btn{position:fixed;z-index:6;width:84px;height:84px;border-radius:50%;background:#ffffff22;border:2px solid #ffffff66;color:#fff;font-size:30px;display:none;align-items:center;justify-content:center;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;backdrop-filter:blur(4px);transition:transform .08s,background .08s;line-height:1}
+.btn.on{background:#ffffff77;transform:scale(.92)}
+body.mobile.play .btn{display:flex}
+#bJump{right:16px;bottom:calc(22px + env(safe-area-inset-bottom,0px))}
+#bDrift{right:112px;bottom:calc(22px + env(safe-area-inset-bottom,0px));font-size:26px}
+#bTurbo{right:16px;bottom:calc(118px + env(safe-area-inset-bottom,0px));font-size:26px}
+#nm{position:fixed;z-index:7;left:50%;transform:translateX(-50%);top:46%;width:200px;padding:10px 14px;border-radius:12px;border:2px solid #ffffff55;background:#00000066;color:#fff;font:600 17px system-ui;text-align:center;display:none;outline:none;box-sizing:border-box}
+body.menu #nm{display:block}
+#choose{position:fixed;inset:0;z-index:9;display:none;flex-direction:column;align-items:center;justify-content:center;background:#04182bee;backdrop-filter:blur(6px);padding:24px;text-align:center}
+#choose.on{display:flex}
+#choose h2{color:#fff;font-size:clamp(20px,6vw,30px);margin:0 0 22px}
+#choose .row{display:flex;gap:18px;flex-wrap:wrap;justify-content:center}
+#choose button{font:700 clamp(16px,4.5vw,20px) system-ui;color:#fff;background:#1e88e5;border:0;border-radius:18px;padding:22px 30px;min-width:150px;cursor:pointer;box-shadow:0 8px 24px #0006}
+#choose button.m{background:#43a047}
+#choose p{color:#bcd;font-size:13px;margin-top:24px;line-height:1.7;max-width:430px}
+</style></head><body>
+<canvas id="gl"></canvas><canvas id="c"></canvas>
+<div class="btn" id="bJump">▲</div>
+<div class="btn" id="bDrift">💨</div>
+<div class="btn" id="bTurbo">🔥</div>
+<input id="nm" maxlength="10" autocomplete="off" spellcheck="false" value="YOU">
+<div id="choose">
+  <h2>How do you want to play?</h2>
+  <div class="row">
+    <button id="cPc">🖥️ PC</button>
+    <button id="cMo" class="m">📱 Mobile</button>
+  </div>
+  <p><b>PC</b> — Arrows / WASD drive · <b>Space</b> jump · <b>Ctrl</b> drift · <b>Shift</b> turbo<br>
+  <b>Mobile</b> — drag anywhere on the screen to drive · on-screen <b>▲</b> jump, <b>💨</b> drift, <b>🔥</b> turbo</p>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+"use strict";
+/* =========================================================================
+   HEX KNOCKOUT 3D  —  last car standing
+   Pure JS but written for speed: typed arrays, in-place compaction,
+   spatial-hash tile lookup, zero per-frame allocations in hot paths.
+   ========================================================================= */
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const WORLD=1500,TR=75,AP=Math.sqrt(3)/2*TR,CX=750,CY=750,MAXP=700;
+const keys={};
+let W=1,H=1,vg=null;
+let ctrl='',pname='YOU',dia=0;
+try{
+  ctrl=localStorage.getItem('bc_ctrl')||'';
+  pname=localStorage.getItem('bc_name')||'YOU';
+  dia=+localStorage.getItem('bc_dia')||0;
+}catch(e){}
+const saveCfg=()=>{try{localStorage.setItem('bc_ctrl',ctrl);localStorage.setItem('bc_name',pname);localStorage.setItem('bc_dia',dia)}catch(e){}};
+
+/* ---------------- renderer ---------------- */
+const R=new THREE.WebGLRenderer({canvas:document.getElementById('gl'),antialias:true,powerPreference:'high-performance'});
+R.setPixelRatio(Math.min(devicePixelRatio||1,2));
+R.shadowMap.enabled=true;R.shadowMap.type=THREE.PCFSoftShadowMap;
+R.outputEncoding=THREE.sRGBEncoding;
+R.toneMapping=THREE.ACESFilmicToneMapping;R.toneMappingExposure=1.12;
+
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x072a4d);
+scene.fog=new THREE.Fog(0x072a4d,900,3200);
+const cam=new THREE.PerspectiveCamera(62,1,5,7000);
+
+scene.add(new THREE.HemisphereLight(0xcfe8ff,0x14243f,1.05));
+const sun=new THREE.DirectionalLight(0xfff3e0,1.45);
+sun.castShadow=true;sun.shadow.mapSize.set(2048,2048);
+Object.assign(sun.shadow.camera,{left:-430,right:430,top:430,bottom:-430,near:10,far:1800});
+sun.shadow.bias=-0.0006;
+scene.add(sun,sun.target);
+const rim=new THREE.DirectionalLight(0x6ec6ff,0.55);rim.position.set(-1,0.7,-1);scene.add(rim);
+
+function rs(){
+  W=cv.width=innerWidth;H=cv.height=innerHeight;
+  R.setSize(W,H,false);cam.aspect=W/H;cam.updateProjectionMatrix();
+  vg=ctx.createRadialGradient(W/2,H/2,Math.min(W,H)*0.35,W/2,H/2,Math.max(W,H)*0.78);
+  vg.addColorStop(0,'rgba(0,0,0,0)');vg.addColorStop(1,'rgba(0,8,25,.6)');
+}
+addEventListener('resize',rs);rs();
+
+/* ---------------- ocean ---------------- */
+const oG=new THREE.PlaneGeometry(9000,9000,56,56);oG.rotateX(-Math.PI/2);
+const ocean=new THREE.Mesh(oG,new THREE.MeshPhongMaterial({
+  color:0x0d63a8,shininess:130,specular:0xaaeaff,transparent:true,opacity:0.95
+}));
+ocean.position.set(CX,-46,CY);scene.add(ocean);
+
+/* ---------------- tiles + spatial hash ---------------- */
+const tiles=[];
+(function(){
+  let ci=0;
+  for(let cx=TR;cx<=WORLD-TR+1;cx+=1.5*TR,ci++){
+    for(let ri=0;;ri++){
+      const cy=AP+ri*2*AP+(ci%2?AP:0);
+      if(cy>WORLD-AP+1)break;
+      const tl={x:cx,y:cy,s:0,f:0,g:0,u:0,k:(ci+ri)%3,m:null};
+      tl.d2=Math.hypot(cx-CX,cy-CY);
+      tiles.push(tl);
+    }
+  }
+})();
+const CS=TR*1.5,GX=((WORLD/CS)|0)+3,grid=new Array(GX*GX);
+for(let i=0;i<tiles.length;i++){
+  const tl=tiles[i];
+  const gx=Math.min(GX-1,(tl.x/CS)|0),gy=Math.min(GX-1,(tl.y/CS)|0),kk=gx+gy*GX;
+  (grid[kk]||(grid[kk]=[])).push(tl);
+}
+/* O(1)-ish lookup — 9 buckets instead of scanning every tile */
+function tileAt(x,y){
+  if(x<0||y<0||x>=WORLD||y>=WORLD)return null;
+  const gx=(x/CS)|0,gy=(y/CS)|0;
+  let best=null,bd=1e18;
+  for(let ox=-1;ox<=1;ox++){
+    const gxi=gx+ox;if(gxi<0||gxi>=GX)continue;
+    for(let oy=-1;oy<=1;oy++){
+      const gyi=gy+oy;if(gyi<0||gyi>=GX)continue;
+      const bucket=grid[gxi+gyi*GX];if(!bucket)continue;
+      for(let i=0;i<bucket.length;i++){
+        const tl=bucket[i],dx=x-tl.x,dy=y-tl.y,d=dx*dx+dy*dy;
+        if(d<bd){bd=d;best=tl}
+      }
+    }
+  }
+  if(!best)return null;
+  const dx=Math.abs(x-best.x),dy=Math.abs(y-best.y);
+  return (dy<=0.866*TR && 0.866*dx+0.5*dy<=0.866*TR)?best:null;
+}
+
+/* ---------------- tile meshes ---------------- */
+const BASE=[new THREE.Color(0x5c6fb8),new THREE.Color(0x546499),new THREE.Color(0x4c5b8e)];
+const ORANGE=new THREE.Color(0xff6b1a);
+const hexG=new THREE.CylinderGeometry(TR*0.96,TR*0.88,26,6);hexG.rotateY(Math.PI/6);hexG.translate(0,-13,0);
+const plateG=new THREE.CylinderGeometry(TR*0.78,TR*0.78,1.4,6);plateG.rotateY(Math.PI/6);plateG.translate(0,0.5,0);
+const plateM=new THREE.MeshStandardMaterial({color:0x9fb4f2,roughness:0.35,metalness:0.45,transparent:true,opacity:0.35,emissive:0x22406e,emissiveIntensity:0.4});
+for(let i=0;i<tiles.length;i++){
+  const tl=tiles[i];
+  const mat=new THREE.MeshStandardMaterial({color:BASE[tl.k].clone(),roughness:0.55,metalness:0.22,emissive:0x000000});
+  const m=new THREE.Mesh(hexG,mat);
+  m.position.set(tl.x,0,tl.y);m.receiveShadow=true;m.castShadow=false;
+  m.add(new THREE.Mesh(plateG,plateM));
+  scene.add(m);tl.m=m;
+}
+/* safe-zone ring */
+const zoneRing=new THREE.Mesh(
+  new THREE.RingGeometry(0.975,1,96).rotateX(-Math.PI/2),
+  new THREE.MeshBasicMaterial({color:0xff1744,transparent:
